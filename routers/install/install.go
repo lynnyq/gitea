@@ -387,6 +387,14 @@ func SubmitInstall(ctx *context.Context) {
 	cfg.Section("service").Key("DEFAULT_ALLOW_CREATE_ORGANIZATION").SetValue(strconv.FormatBool(form.DefaultAllowCreateOrganization))
 	cfg.Section("service").Key("DEFAULT_ENABLE_TIMETRACKING").SetValue(strconv.FormatBool(form.DefaultEnableTimetracking))
 	cfg.Section("service").Key("NO_REPLY_ADDRESS").SetValue(form.NoReplyAddress)
+
+	// [sso] defaults – the section is disabled out of the box so the installer
+	// does not have to provide the public key up-front. Operators flip it on
+	// by editing the generated `app.ini` after install.
+	cfg.Section("sso").Key("ENABLED").SetValue("false")
+	cfg.Section("sso").Key("TIMEOUT").SetValue("10")
+	cfg.Section("sso").Key("SUCCESS_CODE").SetValue("3000")
+	cfg.Section("sso").Key("AUTO_CREATE_USER").SetValue("true")
 	cfg.Section("cron.update_checker").Key("ENABLED").SetValue(strconv.FormatBool(form.EnableUpdateChecker))
 
 	cfg.Section("session").Key("PROVIDER").SetValue("file")

@@ -257,6 +257,8 @@ func prepareSignInPageData(ctx *context.Context) (ret preparedSignInData) {
 	ctx.Data["PageIsSignIn"] = true
 	ctx.Data["PageIsLogin"] = true
 	ctx.Data["EnableSSPI"] = ret.enableSSPI
+	ctx.Data["SSOEnabled"] = setting.SSO.Enabled
+	ctx.Data["SSOMode"] = IsSSOMode(ctx) || (setting.SSO.Enabled && !setting.Service.EnablePasswordSignInForm)
 
 	prepareCommonAuthPageData(ctx, CommonAuthOptions{
 		EnableCaptcha: setting.Service.EnableCaptcha && setting.Service.RequireCaptchaForLogin,
@@ -277,11 +279,39 @@ func SignIn(ctx *context.Context) {
 	if performAutoLoginOAuth2(ctx, &data) {
 		return
 	}
+	// When SSO is the only available login method, jump straight to the SSO tab.
+	if IsSSOMode(ctx) || (setting.SSO.Enabled && !setting.Service.EnablePasswordSignInForm) {
+		ctx.Data["SSOOnly"] = setting.SSO.Enabled && !setting.Service.EnablePasswordSignInForm
+		ctx.Data["SSOMode"] = true
+	}
 	ctx.HTML(http.StatusOK, tplSignIn)
 }
 
 // SignInPost response for sign in request
 func SignInPost(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.SignInForm)
+	if IsSSOMode(ctx) {
+		if !setting.SSO.Enabled {
+			ctx.HTTPError(http.StatusForbidden)
+			return
+		}
+		prepareSignInPageData(ctx)
+		ctx.Data["SSOMode"] = true
+		if ctx.HasError() {
+			ctx.HTML(http.StatusOK, tplSignIn)
+			return
+		}
+		u, err := signInSSO(ctx, form.UserName, form.Password)
+		if err != nil || u == nil {
+			log.Warn("Failed SSO authentication attempt for %s from %s: %v", form.UserName, ctx.RemoteAddr(), err)
+			ctx.RenderWithErrDeprecated(ctx.Tr("auth.sso_login_failed"), tplSignIn, &form)
+			return
+		}
+		// SSO users authenticate against an external service, so 2FA is not applicable.
+		handleSignIn(ctx, u, form.Remember)
+		return
+	}
+
 	if !setting.Service.EnablePasswordSignInForm {
 		ctx.HTTPError(http.StatusForbidden)
 		return
@@ -292,8 +322,6 @@ func SignInPost(ctx *context.Context) {
 		ctx.HTML(http.StatusOK, tplSignIn)
 		return
 	}
-
-	form := web.GetForm(ctx).(*forms.SignInForm)
 
 	if setting.Service.EnableCaptcha && setting.Service.RequireCaptchaForLogin {
 		context.VerifyCaptcha(ctx, tplSignIn, form)

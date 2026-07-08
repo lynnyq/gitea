@@ -72,6 +72,13 @@ func UserSignIn(ctx context.Context, username, password string) (*user_model.Use
 		}
 
 		if hasUser {
+			// SSO users are not bound to a `login_source` row. They must go
+			// through the dedicated SSO login flow; refuse local password
+			// authentication here so we never reach `auth.GetSourceByID`
+			// with a negative id.
+			if user.IsSSO() {
+				return nil, nil, user_model.ErrUserNotExist{Name: username}
+			}
 			source, err := auth.GetSourceByID(ctx, user.LoginSource)
 			if err != nil {
 				return nil, nil, err

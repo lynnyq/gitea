@@ -244,6 +244,17 @@ func (u *User) IsOAuth2() bool {
 	return u.LoginType == auth.OAuth2
 }
 
+// LoginSourceSSO is the magic value stored in `user.login_source` to mark a
+// user that was provisioned by the custom SSO service (see
+// `modules/auth/sso`). It deliberately does not reference any row in the
+// `login_source` table.
+const LoginSourceSSO int64 = -2
+
+// IsSSO reports whether the user authenticates via the custom SSO service.
+func (u *User) IsSSO() bool {
+	return u != nil && u.LoginSource == LoginSourceSSO
+}
+
 // MaxCreationLimit returns the number of repositories a user or an organization is allowed to create
 func (u *User) MaxCreationLimit() int {
 	if u.MaxRepoCreation > -1 {

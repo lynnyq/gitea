@@ -16,8 +16,10 @@ import (
 	"gitea.dev/modules/setting"
 	"gitea.dev/modules/test"
 	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
 	"gitea.dev/services/auth/source/oauth2"
 	"gitea.dev/services/contexttest"
+	"gitea.dev/services/forms"
 
 	"github.com/markbates/goth"
 	"github.com/markbates/goth/gothic"
@@ -62,6 +64,25 @@ func TestWebAuthUserLogin(t *testing.T) {
 	ctx.IsSigned = true
 	SignIn(ctx)
 	assert.Equal(t, "/", test.RedirectURL(resp))
+}
+
+func TestWebAuthSSOMode(t *testing.T) {
+	t.Run("SignInWithSSOModeQuery", func(t *testing.T) {
+		ctx, resp := contexttest.MockContext(t, "/user/login?mode=sso")
+		SignIn(ctx)
+		assert.Equal(t, http.StatusOK, resp.Code)
+		// the SSO tab should be marked active when the SSO login form is
+		// requested through the `mode=sso` query parameter.
+		assert.Equal(t, true, ctx.Data["SSOMode"])
+	})
+
+	t.Run("SignInPostRejectsSSOWhenDisabled", func(t *testing.T) {
+		defer test.MockVariableValue(&setting.SSO.Enabled, false)()
+		ctx, resp := contexttest.MockContext(t, "/user/login?mode=sso")
+		web.SetForm(ctx, &forms.SignInForm{UserName: "alice", Password: "secret"})
+		SignInPost(ctx)
+		assert.Equal(t, http.StatusForbidden, resp.Code)
+	})
 }
 
 func TestWebAuthOAuth2(t *testing.T) {

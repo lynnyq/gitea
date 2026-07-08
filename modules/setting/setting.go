@@ -158,6 +158,7 @@ func loadCommonSettingsFrom(cfg ConfigProvider) error {
 	loadMirrorFrom(cfg)
 	loadMarkupFrom(cfg)
 	loadGlobalLockFrom(cfg)
+	loadSSOFrom(cfg)
 	loadOtherFrom(cfg)
 	return nil
 }

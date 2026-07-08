@@ -2,15 +2,25 @@
 	{{if or (not .LinkAccountMode) (and .LinkAccountMode .LinkAccountModeSignIn)}}
 	{{template "base/alert" .}}
 	{{end}}
+	{{$showSSOTab := and .SSOEnabled (not .LinkAccountMode)}}
+	{{$showLocalTab := and .EnablePasswordSignInForm (not .LinkAccountMode)}}
+	{{if and $showSSOTab $showLocalTab}}
+	<div class="ui top attached tabular menu">
+		<a class="item{{if .SSOMode}} active{{end}}" data-tab="sso" href="{{.SignInLink}}?mode=sso">{{ctx.Locale.Tr "auth.sso_login_tab"}}</a>
+		<a class="item{{if not .SSOMode}} active{{end}}" data-tab="local" href="{{.SignInLink}}">{{ctx.Locale.Tr "auth.login_userpass"}}</a>
+	</div>
+	{{end}}
 	<h4 class="ui top attached header center">
 		{{if .LinkAccountMode}}
 			{{ctx.Locale.Tr "auth.oauth_signin_title"}}
+		{{else if and $showSSOTab (or .SSOMode (not $showLocalTab))}}
+			{{ctx.Locale.Tr "auth.sso_login_title"}}
 		{{else}}
 			{{ctx.Locale.Tr "auth.login_userpass"}}
 		{{end}}
 	</h4>
 	<div class="ui attached segment">
-		{{if .EnablePasswordSignInForm}}
+		{{if and (or (not $showSSOTab) (not .SSOMode)) $showLocalTab}}
 		<form class="ui form" action="{{.SignInLink}}" method="post">
 			<div class="required field {{if and (.Err_UserName) (or (not .LinkAccountMode) (and .LinkAccountMode .LinkAccountModeSignIn))}}error{{end}}">
 				<label for="user_name">{{ctx.Locale.Tr "home.uname_holder"}}</label>
@@ -46,12 +56,33 @@
 				</button>
 			</div>
 		</form>
-		{{end}}{{/*end if .EnablePasswordSignInForm*/}}
+		{{end}}{{/*end if show local form*/}}
+		{{if and $showSSOTab (or .SSOMode (not $showLocalTab))}}
+		<form class="ui form" action="{{.SignInLink}}?mode=sso" method="post">
+			<div class="required field {{if .Err_UserName}}error{{end}}">
+				<label for="sso_user_name">{{ctx.Locale.Tr "home.uname_holder"}}</label>
+				<input id="sso_user_name" type="text" name="user_name" value="{{.user_name}}" autofocus required tabindex="1">
+			</div>
+			<div class="required field {{if .Err_Password}}error{{end}}">
+				<label for="sso_password">{{ctx.Locale.Tr "password"}}</label>
+				<input id="sso_password" name="password" type="password" value="{{.password}}" autocomplete="current-password" required tabindex="2">
+			</div>
+			<div class="inline field">
+				<div class="ui checkbox">
+					<label>{{ctx.Locale.Tr "auth.remember_me"}}</label>
+					<input name="remember" type="checkbox" tabindex="5">
+				</div>
+			</div>
+			<div class="field">
+				<button class="ui primary button tw-w-full" tabindex="3">{{ctx.Locale.Tr "auth.sso_login_submit"}}</button>
+			</div>
+		</form>
+		{{end}}
 		{{$showExternalAuthMethods := or .OAuth2Providers .EnableOpenIDSignIn .EnableSSPI}}
-		{{if and $showExternalAuthMethods .EnablePasswordSignInForm}}
+		{{if and $showExternalAuthMethods (and (or (not $showSSOTab) (not .SSOMode)) $showLocalTab)}}
 			<div class="divider divider-text">{{ctx.Locale.Tr "sign_in_or"}}</div>
 		{{end}}
-		{{if $showExternalAuthMethods}}
+		{{if and $showExternalAuthMethods (or (not $showSSOTab) (not .SSOMode))}}
 			{{template "user/auth/external_auth_methods" .}}
 		{{end}}
 	</div>
