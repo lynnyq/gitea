@@ -249,20 +249,36 @@ Gitea 原生的 `/user/login` 路由同时承载本地登录与 SSO 登录，通
 
 1. 校验 `setting.SSO.Enabled` 与入参非空
 2. 调用 `sso.Authenticate(ctx, loginName, password)` 加密密码并请求 SSO 服务
-3. 校验响应 `Success(SuccessCode)`
-4. 按 `loginName` 查找本地用户 `user_model.GetIndividualUserByName`
-5. 用户存在 → `syncSSOUser`；不存在 → `createSSOUser`（受 `AutoCreateUser` 控制）
-6. 返回 user 交给 `handleSignIn` 建立会话
+3. 校验响应 `Success(SuccessCode)`；若 SSO 返回了规范的 `content.LoginName`，以其为准（避免大小写/空白差异把同一账号拆成多个本地用户）
+4. 查找本地用户（两级查找）：
+   a. 按名字精确查找 `GetIndividualUserByName(loginName)`（覆盖登录名本身就是合法用户名的场景）
+   b. 未找到则按 SSO 绑定查找 `GetIndividualUserByLoginSource(NoType, LoginSourceSSO, loginName)`（覆盖用户名被规范化的场景，如 `san zhang` → `san-zhang`）
+5. 命中的用户若已绑定**其他** SSO 登录名（`login_name` 不一致），拒绝登录，防止账号抢占
+6. 用户存在 → `syncSSOUser`；不存在 → `createSSOUser`（受 `AutoCreateUser` 控制）
+7. 返回 user 交给 `handleSignIn` 建立会话
+
+#### 用户名规范化（`normalizeSSOUserName`）
+
+Gitea 用户名出现在 URL 路径中，不允许空格等字符（`^[\da-zA-Z][-.\w]*$`）。SSO 登录名如 `san zhang` 无法直接作为用户名，因此建号前做与 OAuth2 登录相同的规范化（`user_model.NormalizeUserName`）：
+
+- 空格（及 `~`、`+`）替换为 `-`：`san zhang` → `san-zhang`
+- 连续空白折叠后再替换，避免产生非法的连续 `-`
+- 邮箱形态截取 `@` 前缀；变音符号折叠为 ASCII
+- 规范化后仍不合法（如纯中文登录名）→ 返回明确错误，不建半截用户
+
+原始 SSO 登录名保存在 `user.login_name`，作为后续登录的回访关联键（第 4b 步）。
 
 #### createSSOUser
 
 创建新用户，关键字段：
 
+- `Name = normalizeSSOUserName(loginName)`（原始登录名不合法时映射为合法用户名）
+- `LoginName = loginName`（保存原始 SSO 登录名，用于回访关联）
 - `LoginSource = user_model.LoginSourceSSO`（-2）
-- `LoginType = 0`（本地类型，避免触发外部源查找）
+- `LoginType = auth.NoType`（本地类型，避免触发外部源查找）
 - `IsActive = true`（通过 `CreateUserOverwriteOptions` 设置）
 - `Passwd` 留空（SSO 用户不走本地密码校验）
-- 邮箱为空时回退为 `<loginName>@sso.local`
+- 邮箱为空时回退为 `<规范化名>@sso.local`
 - 显示名优先取 `content.UserName`，其次 `content.IDCardName`
 - 记录 `Meta.InitialIP` 与 `Meta.InitialUserAgent` 用于审计
 
@@ -271,7 +287,7 @@ Gitea 原生的 `/user/login` 路由同时承载本地登录与 SSO 登录，通
 更新已存在用户：
 
 - 通过 `user_service.UpdateUser` 更新 `FullName`（仅当 SSO 返回了非空值）
-- 若 `LoginSource != LoginSourceSSO`，强制改回 `-2`（防止管理员误改后走错流程）
+- 若 `LoginSource != LoginSourceSSO` 或 `LoginName` 变化，一并重断言 `login_source` 与 `login_name`（防止管理员误改后走错流程、绑定漂移）
 
 ### 5.3 本地登录拦截
 
@@ -494,6 +510,7 @@ Gitea 后端调用的外部 SSO 服务接口：
 | 认证失败 `code != SuccessCode` | 用户名/密码错误或 `SUCCESS_CODE` 配置不匹配 | 检查 SSO 服务日志，确认 `SUCCESS_CODE` 与 SSO 实际返回的 code 一致 |
 | 用户创建失败 | 数据库写入错误或用户名冲突 | 检查数据库连接与 `user` 表唯一约束 |
 | SSO 用户被本地登录拒绝 | 预期行为 | SSO 用户必须走 `?mode=sso`，本地登录会返回 `ErrUserNotExist` |
+| 登录名带空格（如 `san zhang`）登录失败 | 建号时用户名规范化冲突，或规范化的名字已被其他账号占用 | 正常会自动映射为 `san-zhang` 建号并以 `login_name` 关联；若失败，查看日志 `cannot map sso login name`（规范化后仍非法）或 `SSO login name conflict`（规范化后的用户名被别的账号占用） |
 | `git clone`/`git push` 报认证失败（HTTP） | 用户名/密码错误、`[sso] ENABLED=false`、或 `SERVICE.ENABLE_BASIC_AUTH=false` | 确认使用 SSO 账号密码（或改用 Personal Access Token）；确认 `[sso]` 已启用；查看日志 `Basic Authorization: SSO fallback failed` |
 
 ### 10.2 日志排查
@@ -504,7 +521,8 @@ SSO 登录相关日志关键字（`log.Warn`/`log.Trace`）：
 SSO authentication request failed for <user> from <ip>: <err>
 SSO authentication rejected for <user>: code=<code> message=<msg>
 Failed SSO authentication attempt for <user> from <ip>: <err>
-SSO auto-created user: <name>
+SSO auto-created user: <name> (sso login: <login>)
+SSO login name conflict: gitea user <name> is bound to sso login <login>, refusing login as <login>
 Basic Authorization: Logged in user <name> via SSO
 Basic Authorization: SSO fallback failed for <user>: <err>
 ```
