@@ -128,6 +128,38 @@
 5. **用户同步**：已存在用户调用 `syncSSOUser` 更新信息并标记为 SSO 用户；新用户调用 `createSSOUser` 自动创建。
 6. **会话建立**：由 `handleSignIn` 完成 Session/Cookie 设置并重定向。
 
+### 3.3 Git / API Basic Auth 认证流程
+
+`git clone` / `git push`（HTTP）以及 API 调用使用 HTTP Basic Auth，不携带浏览器 Session，因此走独立的认证链路。SSO 用户的本地密码为空，`UserSignIn` 会拒绝本地密码校验，此时由 `services/auth/basic.go` 兜底委托给 SSO 服务：
+
+```
+git clone / push (HTTP Basic Auth)
+       │
+       ▼
+  services/auth Basic.Verify()
+       │
+       ▼
+  先尝试 Token / 本地密码认证（UserSignIn）
+       │
+       ├── 成功 ──▶ 正常通过
+       │
+       └── ErrUserNotExist 且 SSO.Enabled
+              │
+              ▼
+         SignInSSO()（与 Web 登录共用同一入口）
+              │
+              ├── SSO 认证成功 ──▶ 返回用户，LoginMethod=basic
+              │                    （git/API/LFS 全部生效）
+              └── SSO 认证失败 ──▶ 返回 401 认证失败
+```
+
+说明：
+
+1. **触发条件**：仅当本地认证返回 `ErrUserNotExist`（用户不存在或用户为 SSO 用户）且 `[sso] ENABLED = true` 时触发兜底；本地用户密码错误返回的是 `ErrUserPasswordInvalid`，不会触发。
+2. **口径统一**：兜底与 Web 登录共用 `services/auth.SignInSSO`，用户自动创建、资料同步、`LoginSource` 强制标记等规则完全一致。
+3. **2FA 豁免**：SSO 用户的外部认证由 SSO 服务负责，与 Web 登录一致跳过本地 TOTP/WebAuthn 校验。
+4. **限制**：受全局 `SERVICE.ENABLE_BASIC_AUTH` 开关控制；若该开关关闭，Basic Auth 整体（含 SSO 兜底）不可用。
+
 ---
 
 ## 4. 密码加密方式
@@ -211,9 +243,9 @@ Gitea 原生的 `/user/login` 路由同时承载本地登录与 SSO 登录，通
 
 ### 5.2 SSO 登录处理函数
 
-**文件**: `routers/web/auth/sso.go`
+**文件**: `services/auth/sso.go`（核心实现）、`routers/web/auth/sso.go`（Web 薄封装）
 
-`signInSSO(ctx, loginName, password)` 主流程：
+`SignInSSO(ctx, loginName, password, initialIP, initialUserAgent)` 主流程（Web 登录的 `signInSSO` 与 Git/API Basic Auth 兜底共用此入口）：
 
 1. 校验 `setting.SSO.Enabled` 与入参非空
 2. 调用 `sso.Authenticate(ctx, loginName, password)` 加密密码并请求 SSO 服务
@@ -263,13 +295,39 @@ if hasUser {
 
 这避免了负数 `LoginSource` 传入 `GetSourceByID` 导致的查询错误。
 
-### 5.4 配置加载
+### 5.4 Git/API Basic Auth 兜底
+
+**文件**: `services/auth/basic.go`
+
+`Basic.Verify` 在本地认证（Token、本地密码）返回 `ErrUserNotExist` 且 `[sso] ENABLED = true` 时，将 Basic Auth 的用户名/密码委托给 `SignInSSO` 认证：
+
+```go
+u, source, err := UserSignIn(req.Context(), uname, passwd)
+if err != nil {
+    if !user_model.IsErrUserNotExist(err) {
+        log.Error("UserSignIn: %v", err)
+        return nil, err
+    }
+    if !setting.SSO.Enabled {
+        return nil, err
+    }
+    // SSO users carry no local password: delegate the credentials to the
+    // external SSO service so git/API/LFS basic auth accepts the same
+    // account as the web SSO login.
+    ssoUser, ssoErr := SignInSSO(req.Context(), uname, passwd, req.RemoteAddr, req.UserAgent())
+    ...
+}
+```
+
+SSO 兜底成功后 `LoginMethod` 标记为 `basic`，与普通 Basic Auth 一致，git smart HTTP、LFS、API 路由全部生效；SSO 认证失败则保持原有 401 行为。
+
+### 5.5 配置加载
 
 **文件**: `modules/setting/sso.go`
 
 `loadSSOFrom(rootCfg)` 在 `loadCommonSettingsFrom` 中被调用（见 `modules/setting/setting.go`），从 `[sso]` 段读取配置。启用时强制校验 `URL` 与 `PUBLIC_KEY` 非空，否则 `log.Fatal`。
 
-### 5.5 安装向导默认值
+### 5.6 安装向导默认值
 
 **文件**: `routers/install/install.go`
 
@@ -436,6 +494,7 @@ Gitea 后端调用的外部 SSO 服务接口：
 | 认证失败 `code != SuccessCode` | 用户名/密码错误或 `SUCCESS_CODE` 配置不匹配 | 检查 SSO 服务日志，确认 `SUCCESS_CODE` 与 SSO 实际返回的 code 一致 |
 | 用户创建失败 | 数据库写入错误或用户名冲突 | 检查数据库连接与 `user` 表唯一约束 |
 | SSO 用户被本地登录拒绝 | 预期行为 | SSO 用户必须走 `?mode=sso`，本地登录会返回 `ErrUserNotExist` |
+| `git clone`/`git push` 报认证失败（HTTP） | 用户名/密码错误、`[sso] ENABLED=false`、或 `SERVICE.ENABLE_BASIC_AUTH=false` | 确认使用 SSO 账号密码（或改用 Personal Access Token）；确认 `[sso]` 已启用；查看日志 `Basic Authorization: SSO fallback failed` |
 
 ### 10.2 日志排查
 
@@ -446,6 +505,8 @@ SSO authentication request failed for <user> from <ip>: <err>
 SSO authentication rejected for <user>: code=<code> message=<msg>
 Failed SSO authentication attempt for <user> from <ip>: <err>
 SSO auto-created user: <name>
+Basic Authorization: Logged in user <name> via SSO
+Basic Authorization: SSO fallback failed for <user>: <err>
 ```
 
 ---
@@ -459,6 +520,9 @@ SSO auto-created user: <name>
 | **SSO 配置定义** | `modules/setting/sso.go` |
 | **SSO 配置测试** | `modules/setting/sso_test.go` |
 | **SSO 登录处理** | `routers/web/auth/sso.go` |
+| **SSO 核心实现（登录+供给+同步）** | `services/auth/sso.go` |
+| **SSO 核心实现测试** | `services/auth/sso_test.go` |
+| **Basic Auth SSO 兜底** | `services/auth/basic.go` |
 | **登录路由入口** | `routers/web/auth/auth.go` |
 | **登录路由测试** | `routers/web/auth/auth_test.go` |
 | **本地登录拦截** | `services/auth/signin.go` |

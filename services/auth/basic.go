@@ -143,8 +143,22 @@ func (b *Basic) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 	if err != nil {
 		if !user_model.IsErrUserNotExist(err) {
 			log.Error("UserSignIn: %v", err)
+			return nil, err
 		}
-		return nil, err
+		if !setting.SSO.Enabled {
+			return nil, err
+		}
+		// SSO users carry no local password: delegate the credentials to the
+		// external SSO service so git/API/LFS basic auth accepts the same
+		// account as the web SSO login.
+		ssoUser, ssoErr := SignInSSO(req.Context(), uname, passwd, req.RemoteAddr, req.UserAgent())
+		if ssoErr != nil {
+			log.Trace("Basic Authorization: SSO fallback failed for %s: %v", uname, ssoErr)
+			return nil, err
+		}
+		store.GetData()["LoginMethod"] = BasicMethodName
+		log.Trace("Basic Authorization: Logged in user %s via SSO", ssoUser.Name)
+		return ssoUser, nil
 	}
 
 	if !source.TwoFactorShouldSkip() {
