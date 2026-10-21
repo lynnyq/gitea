@@ -45,28 +45,44 @@ func SignInSSO(ctx context.Context, loginName, password, initialIP, initialUserA
 	}
 	content := resp.Content
 
-	// prefer the canonical login name reported by the SSO service so that
-	// casing/whitespace drift in the typed name cannot split one account
-	// into multiple local users
+	// The login name the user typed is the identity used to authenticate
+	// against the SSO service (see the sso.Authenticate call above). It must
+	// also be the identity used to locate the local binding, otherwise an
+	// account provisioned with a spaced login name like "zhang san" cannot
+	// be found again when the SSO service returns a differently shaped
+	// canonical name (e.g. "zhangsan" or "Zhang San").
+	//
+	// The SSO-reported LoginName is kept only as a fallback lookup key so
+	// accounts that were bound under a canonical name in the past are still
+	// reachable.
+	lookupNames := []string{loginName}
 	if content.LoginName != "" {
-		loginName = strings.TrimSpace(content.LoginName)
+		if canonical := strings.TrimSpace(content.LoginName); canonical != "" && canonical != loginName {
+			lookupNames = append(lookupNames, canonical)
+		}
 	}
 
-	// Look up the local user, first by the exact name (covers accounts whose
-	// SSO login name is a valid Gitea username), then by the SSO binding
-	// (login_name) for users whose Gitea name had to be normalized, e.g.
-	// "san zhang" -> "san-zhang".
-	user, err := user_model.GetIndividualUserByName(ctx, loginName)
-	if err != nil && !user_model.IsErrUserNotExist(err) {
-		return nil, err
-	}
-	if user == nil {
-		boundUser, has, err2 := user_model.GetIndividualUserByLoginSource(ctx, auth.NoType, user_model.LoginSourceSSO, loginName)
+	// Look up the local user, first by the exact Gitea name (covers accounts
+	// whose SSO login name is a valid Gitea username), then by the SSO
+	// binding (login_name) for users whose Gitea name had to be normalized,
+	// e.g. "san zhang" -> "san-zhang".
+	var user *user_model.User
+	for _, name := range lookupNames {
+		u, err := user_model.GetIndividualUserByName(ctx, name)
+		if err != nil && !user_model.IsErrUserNotExist(err) {
+			return nil, err
+		}
+		if u != nil {
+			user = u
+			break
+		}
+		boundUser, has, err2 := user_model.GetIndividualUserByLoginSource(ctx, auth.NoType, user_model.LoginSourceSSO, name)
 		if err2 != nil {
 			return nil, err2
 		}
 		if has {
 			user = boundUser
+			break
 		}
 	}
 	if user != nil && user.LoginSource == user_model.LoginSourceSSO && user.LoginName != "" && user.LoginName != loginName {

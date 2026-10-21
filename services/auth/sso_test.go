@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"gitea.dev/models/auth"
 	"gitea.dev/models/db"
 	"gitea.dev/models/unittest"
 	user_model "gitea.dev/models/user"
@@ -67,10 +68,14 @@ func mockSSOService(t *testing.T) {
 			// derive a per-account email so multiple auto-created users in
 			// one test run do not collide on the unique email constraint
 			email := strings.ReplaceAll(req.LoginName, " ", ".") + "@sso.example.com"
+			// the SSO service reports a canonical login name with internal
+			// whitespace stripped; Gitea must keep using the typed spaced
+			// name as the local binding key instead of this canonical form
+			canonicalLoginName := strings.Join(strings.Fields(req.LoginName), "")
 			resp = sso.Response{
 				Code:    "3000",
 				Message: "ok",
-				Content: &sso.Content{LoginName: req.LoginName, UserName: "SSO User", Email: email},
+				Content: &sso.Content{LoginName: canonicalLoginName, UserName: "SSO User", Email: email},
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -154,6 +159,35 @@ func TestSignInSSO(t *testing.T) {
 		u2, err := SignInSSO(t.Context(), "san-zhang", ssoTestPassword, "127.0.0.1:1", "test-agent")
 		assert.Error(t, err)
 		assert.Nil(t, u2)
+	})
+
+	t.Run("SpacedLoginNameKeepsTypedBinding", func(t *testing.T) {
+		// The mock SSO replies with a canonical login name that has internal
+		// whitespace stripped ("zhang san" -> "zhangsan"). The local binding
+		// must remain keyed on the typed spaced name, so the canonical form
+		// cannot be used to look up the account.
+		u, err := SignInSSO(t.Context(), "zhang san", ssoTestPassword, "127.0.0.1:1", "test-agent")
+		require.NoError(t, err)
+		require.NotNil(t, u)
+		assert.Equal(t, "zhang-san", u.Name)
+		assert.Equal(t, "zhang san", u.LoginName)
+		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
+
+		ctx := t.Context()
+		// the canonical name reported by SSO must not match the binding
+		_, has, err := user_model.GetIndividualUserByLoginSource(ctx, auth.NoType, user_model.LoginSourceSSO, "zhangsan")
+		require.NoError(t, err)
+		assert.False(t, has)
+		// the typed spaced name must match the binding
+		bound, has, err := user_model.GetIndividualUserByLoginSource(ctx, auth.NoType, user_model.LoginSourceSSO, "zhang san")
+		require.NoError(t, err)
+		require.True(t, has)
+		assert.Equal(t, u.ID, bound.ID)
+
+		// a second sign-in with the same spaced name reuses the account
+		u2, err := SignInSSO(t.Context(), "zhang san", ssoTestPassword, "127.0.0.1:1", "test-agent")
+		require.NoError(t, err)
+		assert.Equal(t, u.ID, u2.ID)
 	})
 
 	t.Run("UnmappableLoginNameRejected", func(t *testing.T) {
