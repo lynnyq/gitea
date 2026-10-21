@@ -46,6 +46,16 @@ func mockSSOService(t *testing.T) {
 	require.NoError(t, err)
 	pubKey := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes}))
 
+	// the mock SSO service only knows a fixed set of account names, like a
+	// real SSO directory: normalized names ("zhang-san") and email-like
+	// logins are unknown, so they exercise the alias fallback against the
+	// bound SSO login
+	knownLogins := map[string]bool{
+		ssoTestLoginName: true,
+		"san zhang":      true,
+		"zhang san":      true,
+	}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req sso.Request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -64,13 +74,8 @@ func mockSSOService(t *testing.T) {
 		}
 
 		resp := sso.Response{Code: "200", Message: "invalid credentials"}
-		if string(plain) == ssoTestPassword {
-			// derive a per-account email so multiple auto-created users in
-			// one test run do not collide on the unique email constraint
+		if knownLogins[req.LoginName] && string(plain) == ssoTestPassword {
 			email := strings.ReplaceAll(req.LoginName, " ", ".") + "@sso.example.com"
-			// the SSO service reports a canonical login name with internal
-			// whitespace stripped; Gitea must keep using the typed spaced
-			// name as the local binding key instead of this canonical form
 			canonicalLoginName := strings.Join(strings.Fields(req.LoginName), "")
 			resp = sso.Response{
 				Code:    "3000",
@@ -97,6 +102,17 @@ func deleteSSOUser(t *testing.T, userID int64) {
 	// also remove the email_address rows, otherwise the unique email
 	// constraint breaks later auto-creation in the same test run
 	_, err = db.GetEngine(ctx).Where("uid = ?", userID).Delete(&user_model.EmailAddress{})
+	require.NoError(t, err)
+}
+
+// renameUser simulates an account provisioned by an older version that
+// normalized the SSO login "zhang san" to the username "zhang-san".
+func renameUser(t *testing.T, userID int64, newName string) {
+	t.Helper()
+	_, err := db.GetEngine(context.Background()).Exec(
+		"UPDATE `user` SET name = ?, lower_name = ? WHERE id = ?",
+		newName, strings.ToLower(newName), userID,
+	)
 	require.NoError(t, err)
 }
 
@@ -130,34 +146,57 @@ func TestSignInSSO(t *testing.T) {
 		assert.Equal(t, "SSO User", u2.FullName)
 	})
 
-	t.Run("SpacedLoginNameNormalized", func(t *testing.T) {
-		// "san zhang" is not a valid Gitea username (spaces are not allowed),
-		// so the account must be provisioned as "san-zhang" and found again
-		// via the login_name binding on subsequent sign-ins
+	t.Run("SpacedLoginNameAsIs", func(t *testing.T) {
+		// username rules now allow inner spaces, so the SSO login "san zhang"
+		// is provisioned verbatim and found again by the exact name on
+		// subsequent sign-ins
 		u, err := SignInSSO(t.Context(), "san zhang", ssoTestPassword, "127.0.0.1:1", "test-agent")
 		require.NoError(t, err)
 		require.NotNil(t, u)
-		assert.Equal(t, "san-zhang", u.Name)
+		assert.Equal(t, "san zhang", u.Name)
 		assert.Equal(t, "san zhang", u.LoginName)
 		assert.Equal(t, user_model.LoginSourceSSO, u.LoginSource)
 		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
 
+		// a second sign-in with the same spaced name must reuse the account
 		u2, err := SignInSSO(t.Context(), "san zhang", ssoTestPassword, "127.0.0.1:1", "test-agent")
 		require.NoError(t, err)
 		assert.Equal(t, u.ID, u2.ID)
-		assert.Equal(t, "san-zhang", u2.Name)
+		assert.Equal(t, "san zhang", u2.Name)
 	})
 
-	t.Run("SpacedLoginNameNotHijacked", func(t *testing.T) {
-		// provision "san zhang" (gitea name "san-zhang"), then sign in with a
-		// different SSO account literally called "san-zhang": it must not be
-		// attached to the account bound to "san zhang"
-		u, err := SignInSSO(t.Context(), "san zhang", ssoTestPassword, "127.0.0.1:1", "test-agent")
+	t.Run("LegacyNormalizedAccountViaAlias", func(t *testing.T) {
+		// simulate an account provisioned by older code that normalized the
+		// SSO login "zhang san" to the username "zhang-san". The SSO service
+		// does not know "zhang-san", so git clients that use the Gitea name
+		// for basic auth must reach the account through the alias fallback
+		// that retries with the bound SSO login.
+		u, err := SignInSSO(t.Context(), "zhang san", ssoTestPassword, "127.0.0.1:1", "test-agent")
+		require.NoError(t, err)
+		assert.Equal(t, "zhang san", u.Name)
+		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
+		renameUser(t, u.ID, "zhang-san")
+
+		// the Gitea username "zhang-san" is unknown to SSO; the alias
+		// fallback must retry with "zhang san" and land on the same account
+		u2, err := SignInSSO(t.Context(), "zhang-san", ssoTestPassword, "127.0.0.1:1", "test-agent")
+		require.NoError(t, err)
+		require.NotNil(t, u2)
+		assert.Equal(t, u.ID, u2.ID)
+		assert.Equal(t, "zhang-san", u2.Name)
+	})
+
+	t.Run("LegacyWrongPasswordRejected", func(t *testing.T) {
+		// the alias fallback re-sends the password to the SSO service, so a
+		// wrong password must still be rejected for the legacy username too
+		u, err := SignInSSO(t.Context(), "zhang san", ssoTestPassword, "127.0.0.1:1", "test-agent")
 		require.NoError(t, err)
 		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
+		renameUser(t, u.ID, "zhang-san")
 
-		u2, err := SignInSSO(t.Context(), "san-zhang", ssoTestPassword, "127.0.0.1:1", "test-agent")
+		u2, err := SignInSSO(t.Context(), "zhang-san", "wrong", "127.0.0.1:1", "test-agent")
 		assert.Error(t, err)
+		assert.True(t, user_model.IsErrUserNotExist(err))
 		assert.Nil(t, u2)
 	})
 
@@ -169,7 +208,7 @@ func TestSignInSSO(t *testing.T) {
 		u, err := SignInSSO(t.Context(), "zhang san", ssoTestPassword, "127.0.0.1:1", "test-agent")
 		require.NoError(t, err)
 		require.NotNil(t, u)
-		assert.Equal(t, "zhang-san", u.Name)
+		assert.Equal(t, "zhang san", u.Name)
 		assert.Equal(t, "zhang san", u.LoginName)
 		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
 
@@ -242,16 +281,35 @@ func TestBasicVerifySSOFallback(t *testing.T) {
 	})
 
 	t.Run("SpacedLoginNameViaBasicAuth", func(t *testing.T) {
-		// an SSO account "san zhang" is provisioned as gitea user "san-zhang";
-		// git sends the original spaced login in basic auth, which must land
-		// on the same user through the login_name binding
+		// the SSO account "san zhang" is provisioned verbatim; git sends the
+		// spaced login in basic auth and the fallback finds the user by name
 		u, err := SignInSSO(t.Context(), "san zhang", ssoTestPassword, "127.0.0.1:1", "git/2.43")
 		require.NoError(t, err)
-		assert.Equal(t, "san-zhang", u.Name)
+		assert.Equal(t, "san zhang", u.Name)
 		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
 
-		req := httptest.NewRequest(http.MethodGet, "/san-zhang/some-repo/info/refs", nil)
+		req := httptest.NewRequest(http.MethodGet, "/san%20zhang/some-repo/info/refs", nil)
 		req.SetBasicAuth("san zhang", ssoTestPassword)
+		store := reqctx.NewRequestContextForTest(req.Context())
+		u2, err := (&Basic{}).Verify(req, httptest.NewRecorder(), store, nil)
+		require.NoError(t, err)
+		require.NotNil(t, u2)
+		assert.Equal(t, u.ID, u2.ID)
+		assert.Equal(t, BasicMethodName, store.GetData()["LoginMethod"])
+	})
+
+	t.Run("LegacyNormalizedAccountViaBasicAuth", func(t *testing.T) {
+		// older versions normalized "zhang san" to "zhang-san": git clients
+		// that still use the normalized username must authenticate through
+		// the alias fallback and land on the bound account
+		u, err := SignInSSO(t.Context(), "zhang san", ssoTestPassword, "127.0.0.1:1", "git/2.43")
+		require.NoError(t, err)
+		assert.Equal(t, "zhang san", u.Name)
+		t.Cleanup(func() { deleteSSOUser(t, u.ID) })
+		renameUser(t, u.ID, "zhang-san")
+
+		req := httptest.NewRequest(http.MethodGet, "/zhang-san/some-repo/info/refs", nil)
+		req.SetBasicAuth("zhang-san", ssoTestPassword)
 		store := reqctx.NewRequestContextForTest(req.Context())
 		u2, err := (&Basic{}).Verify(req, httptest.NewRecorder(), store, nil)
 		require.NoError(t, err)

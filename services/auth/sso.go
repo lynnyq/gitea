@@ -35,6 +35,21 @@ func SignInSSO(ctx context.Context, loginName, password, initialIP, initialUserA
 	}
 
 	resp, err := sso.Authenticate(ctx, loginName, password)
+	if err != nil || !resp.Success(setting.SSO.SuccessCode) {
+		// Git clients naturally send the Gitea username (e.g. "zhang-san"
+		// for a legacy normalized account) or the primary email as the basic
+		// auth user, while the SSO service only knows the raw SSO login
+		// ("zhang san"). Retry with the SSO login bound to the matching
+		// local account; the SSO service still validates the password, so
+		// this cannot authenticate anyone but the account owner.
+		if alias := findSSOUserAlias(ctx, loginName); alias != nil {
+			resp, err = sso.Authenticate(ctx, alias.LoginName, password)
+			if err == nil && resp.Success(setting.SSO.SuccessCode) {
+				log.Trace("SSO authentication for %s succeeded via bound login %s", loginName, alias.LoginName)
+				loginName = alias.LoginName
+			}
+		}
+	}
 	if err != nil {
 		log.Warn("SSO authentication request failed for %s from %s: %v", loginName, initialIP, err)
 		return nil, user_model.ErrUserNotExist{Name: loginName}
@@ -111,37 +126,45 @@ func SignInSSO(ctx context.Context, loginName, password, initialIP, initialUserA
 	return user, nil
 }
 
-// normalizeSSOUserName maps an SSO login name to a valid Gitea username using
-// the same normalization as the OAuth2 login: whitespace is replaced with "-"
-// ("san zhang" -> "san-zhang"), diacritics are folded to ASCII and email-like
-// inputs are cut at "@". The original login name is kept in `login_name`.
-func normalizeSSOUserName(loginName string) (string, error) {
-	// collapse whitespace runs first, otherwise "a  b" would normalize to
-	// "a--b" which is rejected by the username pattern
-	name, err := user_model.NormalizeUserName(strings.Join(strings.Fields(loginName), " "))
-	if err != nil {
-		return "", err
+// findSSOUserAlias returns the locally provisioned SSO user whose Gitea name
+// or primary email matches the given identifier — e.g. "zhang-san" or
+// "zhang.san@example.com" for the SSO login "zhang san" — or nil when the
+// identifier does not belong to an SSO-bound account.
+func findSSOUserAlias(ctx context.Context, identifier string) *user_model.User {
+	user, err := user_model.GetIndividualUserByName(ctx, identifier)
+	if user_model.IsErrUserNotExist(err) {
+		user, err = user_model.GetIndividualUserByPrimaryEmail(ctx, identifier)
 	}
-	if err := user_model.IsUsableUsername(name); err != nil {
-		return "", fmt.Errorf("cannot map sso login name %q to a valid username (got %q): %w", loginName, name, err)
+	if err != nil || user == nil {
+		return nil
 	}
-	return name, nil
+	// only retry with a *different* bound SSO login and only for accounts that
+	// are actually bound to the SSO service
+	if user.LoginSource != user_model.LoginSourceSSO || user.LoginName == "" || user.LoginName == identifier {
+		return nil
+	}
+	return user
 }
 
 // createSSOUser creates a brand new local user that is bound to the SSO
 // service. The user's `LoginSource` is set to the magic value
 // `user_model.LoginSourceSSO` so that subsequent logins skip the password
 // check on Gitea and always go through the SSO service.
+//
+// The Gitea username is the raw SSO login name: the username rules allow
+// inner spaces, so an SSO account "zhang san" is provisioned as the user
+// "zhang san". Accounts provisioned by older versions with normalized names
+// (e.g. "zhang-san") keep working through the `login_name` binding and the
+// alias fallback.
 func createSSOUser(ctx context.Context, loginName string, content *sso.Content, initialIP, initialUserAgent string) (*user_model.User, error) {
-	name, err := normalizeSSOUserName(loginName)
-	if err != nil {
-		return nil, err
+	if err := user_model.IsUsableUsername(loginName); err != nil {
+		return nil, fmt.Errorf("sso login name %q is not a usable username: %w", loginName, err)
 	}
 	email := strings.TrimSpace(content.Email)
 	if email == "" {
 		// fall back to a placeholder email so the user can be created; admins
 		// may update it later through the profile settings.
-		email = name + "@sso.local"
+		email = strings.ReplaceAll(loginName, " ", ".") + "@sso.local"
 	}
 	displayName := content.UserName
 	if displayName == "" {
@@ -149,7 +172,7 @@ func createSSOUser(ctx context.Context, loginName string, content *sso.Content, 
 	}
 
 	u := &user_model.User{
-		Name:     name,
+		Name:     loginName,
 		Email:    email,
 		FullName: displayName,
 		// Leave Passwd empty so the row in `user.passwd` is empty / unhashable.

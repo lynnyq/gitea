@@ -118,6 +118,7 @@ func TestIsValidUsername(t *testing.T) {
 		{arg: "abc", want: true},
 		{arg: "0.b-c", want: true},
 		{arg: "a.b-c_d", want: true},
+		{arg: "zhang san", want: true}, // inner spaces are allowed (SSO accounts named "surname firstname")
 		{arg: "", want: false},
 		{arg: ".abc", want: false},
 		{arg: "abc.", want: false},
@@ -131,7 +132,10 @@ func TestIsValidUsername(t *testing.T) {
 		{arg: "-", want: false},
 		{arg: "--diff", want: false},
 		{arg: "-im-here", want: false},
-		{arg: "a space", want: false},
+		{arg: " zhang", want: false},     // no leading space
+		{arg: "zhang ", want: false},     // no trailing space
+		{arg: "zhang  san", want: false}, // no consecutive spaces
+		{arg: "a -b", want: false},       // a space cannot touch another separator
 	}
 	for _, tt := range tests {
 		t.Run(tt.arg, func(t *testing.T) {

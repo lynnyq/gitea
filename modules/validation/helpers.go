@@ -25,8 +25,8 @@ type globalVarsStruct struct {
 var globalVars = sync.OnceValue(func() *globalVarsStruct {
 	return &globalVarsStruct{
 		externalTrackerRegex:    regexp.MustCompile(`({?)(?:user|repo|index)+?(}?)`),
-		validUsernamePattern:    regexp.MustCompile(`^[\da-zA-Z][-.\w]*$`),
-		invalidUsernamePattern:  regexp.MustCompile(`[-._]{2,}|[-._]$`), // No consecutive or trailing non-alphanumeric chars
+		validUsernamePattern:    regexp.MustCompile(`^[\da-zA-Z][-.\w ]*$`), // inner spaces allowed, SSO accounts are named "surname firstname"
+		invalidUsernamePattern:  regexp.MustCompile(`[-._ ]{2,}|[-._ ]$`),   // No consecutive or trailing separators/spaces
 		validBadgeSlugPattern:   regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`),
 		invalidBadgeSlugPattern: regexp.MustCompile(`[-._]{2,}|[-._]$`),
 	}
